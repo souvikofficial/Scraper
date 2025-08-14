@@ -62,7 +62,7 @@ if st.button("🚀 Start Scraping"):
     elif not auto_mode and not fields:
         st.error("❌ Provide at least one field selector or use Auto-discover mode.")
     else:
-        with st.spinner("Scraping in progress..."):
+        with st.spinner("Scraping in progress...."):
             try:
                 results = scrape_site(
                     base_url,
