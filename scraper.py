@@ -1,8 +1,8 @@
-import csv
 import random
 import time
 import re
 import json
+from typing import Callable, Iterable, Optional, Tuple
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
@@ -13,7 +13,17 @@ from selenium.webdriver.chrome.options import Options
 
   
 # HTML FETCHING
-def fetch_html(url, use_selenium=False, user_agents=None, infinite_scroll=False, load_more_selector=None, use_tor=False):
+def fetch_html(
+    url,
+    use_selenium=False,
+    user_agents=None,
+    infinite_scroll=False,
+    load_more_selector=None,
+    use_tor=False,
+    timeout=20,
+    retries=2,
+    backoff=1.5,
+):
     """
     Fetch fully rendered HTML from a page.
     Supports routing through Tor SOCKS5 proxy if use_tor=True.
@@ -23,6 +33,9 @@ def fetch_html(url, use_selenium=False, user_agents=None, infinite_scroll=False,
     if use_selenium:
         options = Options()
         options.add_argument("--headless=new")  # Use new headless mode to reduce logs
+        options.add_argument("--disable-gpu")
+        options.add_argument("--no-sandbox")
+        options.add_argument(f"--user-agent={headers['User-Agent']}")
         if use_tor:
             # Route Chrome through Tor proxy at 127.0.0.1:9050 (default Tor SOCKS5)
             options.add_argument('--proxy-server=socks5://127.0.0.1:9050')
@@ -71,9 +84,21 @@ def fetch_html(url, use_selenium=False, user_agents=None, infinite_scroll=False,
                 'http': 'socks5h://127.0.0.1:9050',
                 'https': 'socks5h://127.0.0.1:9050'
             }
-        res = requests.get(url, headers=headers, timeout=20, proxies=proxies)
-        res.raise_for_status()
-        return res.text
+        session = requests.Session()
+        last_err = None
+        for attempt in range(retries + 1):
+            try:
+                res = session.get(url, headers=headers, timeout=timeout, proxies=proxies)
+                res.raise_for_status()
+                return res.text
+            except requests.RequestException as e:
+                last_err = e
+                if attempt >= retries:
+                    break
+                time.sleep(backoff ** attempt)
+        if last_err:
+            raise last_err
+        return ""
 
 
   
@@ -144,10 +169,12 @@ def parse_with_fields(html, fields):
     base_elems = soup.select(list(fields.values())[0])
     results = []
 
+    elems_by_field = {fname: soup.select(selector) for fname, selector in fields.items()}
+
     for idx in range(len(base_elems)):
         record = {}
         for fname, selector in fields.items():
-            elems = soup.select(selector)
+            elems = elems_by_field.get(fname, [])
             if idx < len(elems):
                 elem = elems[idx]
                 if fname == 'link' and elem.has_attr('href'):
@@ -166,7 +193,13 @@ def parse_with_fields(html, fields):
 # MAIN SCRAPER
 def scrape_site(base_url, fields=None, next_selector=None, use_selenium=False,
                 scrape_all=False, max_pages=1, auto_mode=False,
-                infinite_scroll=False, load_more_selector=None, use_tor=False):
+                infinite_scroll=False, load_more_selector=None, use_tor=False,
+                delay_range: Tuple[float, float] = (1, 2),
+                progress_callback: Optional[Callable[[int, Optional[int]], None]] = None,
+                normalize_urls: bool = True,
+                request_timeout: int = 20,
+                request_retries: int = 2,
+                request_backoff: float = 1.5):
 
     ua_list = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -182,14 +215,33 @@ def scrape_site(base_url, fields=None, next_selector=None, use_selenium=False,
         if not scrape_all and page_count > max_pages:
             break
 
-        html = fetch_html(page_url, use_selenium, ua_list, infinite_scroll, load_more_selector, use_tor=use_tor)
+        html = fetch_html(
+            page_url,
+            use_selenium,
+            ua_list,
+            infinite_scroll,
+            load_more_selector,
+            use_tor=use_tor,
+            timeout=request_timeout,
+            retries=request_retries,
+            backoff=request_backoff,
+        )
         items = auto_discover_items(html) if auto_mode else parse_with_fields(html, fields)
         if not items:
             break
 
         for item in items:
             item["source_url"] = page_url
+            if normalize_urls:
+                if "link" in item and item["link"]:
+                    item["link"] = urljoin(page_url, item["link"])
+                if "image_url" in item and item["image_url"]:
+                    item["image_url"] = urljoin(page_url, item["image_url"])
         all_data.extend(items)
+
+        if progress_callback:
+            total = None if scrape_all else max_pages
+            progress_callback(page_count, total)
 
         soup = BeautifulSoup(html, 'html.parser')
         if not next_selector:
@@ -201,8 +253,11 @@ def scrape_site(base_url, fields=None, next_selector=None, use_selenium=False,
         if next_selector:
             if use_selenium:
                 from selenium.webdriver.common.by import By
-                from selenium.webdriver.chrome.options import Options
-                driver = webdriver.Chrome(options=Options().add_argument("--headless=new"))
+                driver_opts = Options()
+                driver_opts.add_argument("--headless=new")
+                driver_opts.add_argument("--disable-gpu")
+                driver_opts.add_argument("--no-sandbox")
+                driver = webdriver.Chrome(options=driver_opts)
                 try:
                     driver.get(page_url)
                     next_el = driver.find_element(By.CSS_SELECTOR, next_selector)
@@ -230,7 +285,8 @@ def scrape_site(base_url, fields=None, next_selector=None, use_selenium=False,
         else:
             break
 
-        time.sleep(random.uniform(1, 2))
+        if delay_range and delay_range[1] > 0:
+            time.sleep(random.uniform(delay_range[0], delay_range[1]))
 
     return clean_data(all_data)
 
@@ -246,11 +302,22 @@ def clean_data(data):
             cleaned.append({k: (v.strip() if isinstance(v, str) else v) for k, v in row.items()})
     return cleaned
 
-def save_data(data, filename_base):
+def save_data(data, filename_base, formats: Optional[Iterable[str]] = None):
     if not data:
-        return
-    df = pd.DataFrame(data)
-    df.to_csv(filename_base + ".csv", index=False)
-    df.to_excel(filename_base + ".xlsx", index=False)
-    with open(filename_base + ".json", "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        return []
+    formats = {f.lower() for f in (formats or ["csv", "xlsx", "json"])}
+    saved = []
+    df = None
+    if "csv" in formats or "xlsx" in formats:
+        df = pd.DataFrame(data)
+    if "csv" in formats:
+        df.to_csv(filename_base + ".csv", index=False)
+        saved.append(filename_base + ".csv")
+    if "xlsx" in formats:
+        df.to_excel(filename_base + ".xlsx", index=False)
+        saved.append(filename_base + ".xlsx")
+    if "json" in formats:
+        with open(filename_base + ".json", "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        saved.append(filename_base + ".json")
+    return saved
